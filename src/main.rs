@@ -1,12 +1,14 @@
+use chrono::TimeDelta;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
+use std::ops::Sub;
 use std::sync::Arc;
 use std::time::Duration;
 
 use poise::{serenity_prelude as serenity, CreateReply};
 use serenity::{
     ChannelId, CreateEmbed, CreateEmbedAuthor, FormattedTimestamp, FormattedTimestampStyle,
-    FullEvent, Mentionable, Message, ReactionType, Timestamp, UserId,
+    FullEvent, Http, Mentionable, Message, ReactionType, Timestamp, UserId,
 };
 use tokio::{select, sync::Mutex, task, time};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -309,7 +311,7 @@ async fn cooldowns(
         } else {
             "Your tracked cooldowns:\n".to_string()
         };
-        for cooldown in cooldowns {
+        for cooldown in cooldowns.iter().take(15) {
             if show_all {
                 output.push_str(&format!(
                     "- {}: {}\n",
@@ -319,6 +321,9 @@ async fn cooldowns(
             } else {
                 output.push_str(&format!("- {}\n", format_cooldown(cooldown)));
             }
+        }
+        if cooldowns.len() > 15 {
+            output.push_str(&format!("... and {} more", cooldowns.len() - 15));
         }
         output
     };
@@ -393,6 +398,53 @@ fn format_cooldown(cooldown: &Cooldown) -> String {
     }
 }
 
+async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error> {
+    let now = Timestamp::now();
+    let mut any_expired = false;
+    for cooldown in &config.cooldowns {
+        if now >= cooldown.timestamp {
+            println!(
+                "{} cooldown finished: {} (user {}, profile {})",
+                cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
+            );
+            any_expired = true;
+            if config.disabled_users.contains(&cooldown.user_id)
+                // Don't notify if it expired more than 10 minutes ago
+                || *cooldown.timestamp < now.sub(TimeDelta::try_minutes(10).unwrap())
+            {
+                // Remove but don't notify
+                continue;
+            }
+            let message = if cooldown.kind == CooldownKind::Profile {
+                format!(
+                    "{} {} {} cooldown finished",
+                    cooldown.user_id.mention(),
+                    cooldown.kind.emoji(),
+                    cooldown.kind
+                )
+            } else {
+                format!(
+                    "{} {} {} cooldown finished for [**{}**](<{}>)\n```/profiles profile:{}```",
+                    cooldown.user_id.mention(),
+                    cooldown.kind.emoji(),
+                    cooldown.kind,
+                    cooldown.profile_name,
+                    profile_url(cooldown.user_id.get(), Some(&cooldown.profile)),
+                    cooldown.profile
+                )
+            };
+            if let Err(e) = cooldown.channel_id.say(http, &message).await {
+                eprintln!("Failed to send message: {:?}", e);
+            }
+        }
+    }
+    if any_expired {
+        config.cooldowns.retain(|cooldown| now < cooldown.timestamp);
+        save_config(config).await?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let mut config = load_config().await.unwrap();
@@ -400,10 +452,7 @@ async fn main() {
         config.token = std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
     }
     let api_token = config.token.clone();
-    let mut owners = HashSet::new();
-    for user_id in &config.owners {
-        owners.insert(*user_id);
-    }
+    let owners = HashSet::from_iter(config.owners.iter().cloned());
     let config = Arc::new(Mutex::new(config));
     let intents =
         serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
@@ -455,49 +504,11 @@ async fn main() {
                 _ = cloned_token.cancelled() => break,
                 _ = interval.tick() => {},
             }
-
             let mut config = cloned_config.lock().await;
-
-            let now = Timestamp::now();
-            let mut any_expired = false;
-            for cooldown in &config.cooldowns {
-                if now >= cooldown.timestamp {
-                    println!(
-                        "{} cooldown finished: {} (user {}, profile {})",
-                        cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
-                    );
-                    any_expired = true;
-                    if config.disabled_users.contains(&cooldown.user_id) {
-                        // Remove but don't notify
-                        continue;
-                    }
-                    let message = if cooldown.kind == CooldownKind::Profile {
-                        format!(
-                            "{} {} {} cooldown finished",
-                            cooldown.user_id.mention(),
-                            cooldown.kind.emoji(),
-                            cooldown.kind
-                        )
-                    } else {
-                        format!(
-                            "{} {} {} cooldown finished for [**{}**](<{}>)\n```/profiles profile:{}```",
-                            cooldown.user_id.mention(),
-                            cooldown.kind.emoji(),
-                            cooldown.kind,
-                            cooldown.profile_name,
-                            profile_url(cooldown.user_id.get(), Some(&cooldown.profile)),
-                            cooldown.profile
-                        )
-                    };
-                    if let Err(e) = cooldown.channel_id.say(&http, &message).await {
-                        eprintln!("Failed to send message: {:?}", e);
-                    }
-                }
-            }
-            if any_expired {
-                config.cooldowns.retain(|cooldown| now < cooldown.timestamp);
-                if let Err(e) = save_config(&config).await {
-                    eprintln!("Failed to write config: {:?}", e);
+            match run_notifications(&mut config, &http).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error running notifications: {:?}", e);
                 }
             }
         }

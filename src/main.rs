@@ -25,6 +25,7 @@ mod zoo;
 struct Data {
     start_time: Timestamp,
     config: Arc<Mutex<Config>>,
+    client: reqwest::Client,
 }
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -201,7 +202,7 @@ async fn event_handler<'a>(
         {
             return Ok(());
         }
-        let profile = match fetch_zoo_profile(interaction.user.id.get(), None).await {
+        let profile = match fetch_zoo_profile(&data.client, interaction.user.id.get(), None).await {
             Ok(response) => response,
             Err(e) => {
                 eprintln!("Failed to fetch profile {}: {:?}", interaction.user.id, e);
@@ -482,6 +483,7 @@ async fn main() {
                 Ok(Data {
                     start_time: Timestamp::now(),
                     config: cloned_config,
+                    client: reqwest::ClientBuilder::new().build()?,
                 })
             })
         })

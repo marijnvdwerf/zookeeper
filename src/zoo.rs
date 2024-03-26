@@ -267,9 +267,10 @@ pub fn profile_api_url(user_id: u64, profile: Option<&str>) -> String {
 }
 
 pub async fn fetch_zoo_profile(
+    client: &reqwest::Client,
     user_id: u64,
     profile: Option<&str>,
 ) -> Result<ZooProfileResponse, reqwest::Error> {
     let api_url = profile_api_url(user_id, profile);
-    reqwest::get(&api_url).await?.json().await
+    client.get(&api_url).send().await?.json().await
 }

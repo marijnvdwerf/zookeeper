@@ -10,15 +10,22 @@ use anyhow::{Context as _, Error, Result};
 use chrono::TimeDelta;
 use poise::{builtins::register_globally, command, CreateReply, Framework, FrameworkOptions};
 use serenity::{
-    builder::{CreateEmbed, CreateEmbedAuthor},
+    all::CreateEmbedFooter,
+    builder::{
+        CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateInteractionResponse,
+        CreateInteractionResponseMessage,
+    },
+    cache::Cache,
     client::{ClientBuilder, Context as SerenityContext, FullEvent},
-    http::Http,
+    gateway::ActivityData,
+    http::{CacheHttp, Http},
     model::prelude::*,
     utils::{FormattedTimestamp, FormattedTimestampStyle},
+    Client,
 };
-use tokio::{select, sync::Mutex, task, time};
+use tokio::{select, sync::RwLock, task, time};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod parsers;
 mod zoo;
@@ -31,8 +38,10 @@ use zoo::{fetch_zoo_profile, profile_url};
 
 struct Data {
     start_time: Timestamp,
-    config: Arc<Mutex<Config>>,
+    config: Arc<RwLock<Config>>,
     client: reqwest::Client,
+    current_user: CurrentUser,
+    shard: Option<ShardInfo>,
 }
 type Context<'a> = poise::Context<'a, Data, Error>;
 type FrameworkContext<'a> = poise::FrameworkContext<'a, Data, Error>;
@@ -88,6 +97,7 @@ struct Config {
     token: String,
     cooldowns: Vec<Cooldown>,
     disabled_users: BTreeSet<UserId>,
+    manual_users: BTreeSet<UserId>,
 }
 
 async fn load_config() -> Result<Config> {
@@ -109,33 +119,33 @@ async fn save_config(config: &Config) -> Result<()> {
         .with_context(|| format!("Failed to write to {}", config_path))
 }
 
-async fn handle_cooldowns(
+async fn advertise_cooldowns(
     ctx: &SerenityContext,
     message: &Message,
     cooldowns: &[Cooldown],
     data: &Data,
 ) -> Result<()> {
-    {
-        let mut config = data.config.lock().await;
-        for cooldown in cooldowns {
-            if let Some(existing) = config.cooldowns.iter_mut().find(|existing| {
-                existing.kind == cooldown.kind
-                    && existing.user_id == cooldown.user_id
-                    && existing.profile == cooldown.profile
-            }) {
-                // Update existing cooldown
-                existing.channel_id = cooldown.channel_id;
-                existing.profile_name = cooldown.profile_name.clone();
-                existing.timestamp = cooldown.timestamp;
-            } else {
-                config.cooldowns.push(cooldown.clone());
-            }
-        }
-        save_config(&config).await?;
-    }
+    let mut updated = Vec::with_capacity(cooldowns.len());
+    let config = data.config.read().await;
     for cooldown in cooldowns {
+        if let Some(existing) = config.cooldowns.iter().find(|existing| {
+            existing.kind == cooldown.kind
+                && existing.user_id == cooldown.user_id
+                && existing.profile == cooldown.profile
+        }) {
+            let diff =
+                (existing.timestamp.unix_timestamp() - cooldown.timestamp.unix_timestamp()).abs();
+            if diff > 2 {
+                updated.push(existing.clone());
+            }
+        } else {
+            updated.push(cooldown.clone());
+        }
+    }
+    drop(config);
+    for cooldown in &updated {
         info!(
-            "Cooldown captured: {} {} (user {}, profile {})",
+            "Cooldown found: {} {} (user {}, profile {})",
             cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
         );
         let reaction = ReactionType::Unicode(cooldown.kind.emoji().to_string());
@@ -144,24 +154,83 @@ async fn handle_cooldowns(
     Ok(())
 }
 
-async fn check_cooldown_message<'a>(
-    ctx: &'a SerenityContext,
+async fn add_cooldowns(
+    ctx: &SerenityContext,
     message: &Message,
-    data: &'a Data,
+    cooldowns: &[Cooldown],
+    data: &Data,
 ) -> Result<()> {
-    if message.author.id != ZOO_USER_ID {
-        return Ok(());
-    }
-    let Some(interaction) = message.interaction.as_deref() else {
-        return Ok(());
-    };
-    let user_id = interaction.user.id;
-    {
-        let config = data.config.lock().await;
-        if config.disabled_users.contains(&user_id) {
-            return Ok(());
+    let mut updated = Vec::with_capacity(cooldowns.len());
+    let mut config = data.config.write().await;
+    for cooldown in cooldowns {
+        if let Some(existing) = config.cooldowns.iter_mut().find(|existing| {
+            existing.kind == cooldown.kind
+                && existing.user_id == cooldown.user_id
+                && existing.profile == cooldown.profile
+        }) {
+            // Update existing cooldown
+            existing.channel_id = cooldown.channel_id;
+            existing.profile_name = cooldown.profile_name.clone();
+            // Check if timestamp is within 1 second of the existing one,
+            // if not, update it
+            let diff =
+                (existing.timestamp.unix_timestamp() - cooldown.timestamp.unix_timestamp()).abs();
+            if diff > 2 {
+                existing.timestamp = cooldown.timestamp;
+                updated.push(existing.clone());
+            }
+        } else {
+            config.cooldowns.push(cooldown.clone());
+            updated.push(cooldown.clone());
         }
     }
+    save_config(&config).await?;
+    drop(config);
+    for cooldown in &updated {
+        info!(
+            "Cooldown added: {} {} (user {}, profile {})",
+            cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
+        );
+    }
+    if !updated.is_empty() {
+        let reaction = ReactionType::Unicode("✅".to_string());
+        message.react(ctx, reaction).await?;
+    }
+    Ok(())
+}
+
+async fn remove_cooldowns(
+    ctx: &SerenityContext,
+    message: &Message,
+    cooldowns: &[Cooldown],
+    data: &Data,
+) -> Result<()> {
+    let mut config = data.config.write().await;
+    config.cooldowns.retain(|existing| {
+        !cooldowns.iter().any(|cooldown| {
+            existing.kind == cooldown.kind
+                && existing.user_id == cooldown.user_id
+                && existing.profile == cooldown.profile
+        })
+    });
+    save_config(&config).await?;
+    drop(config);
+    for cooldown in cooldowns {
+        info!(
+            "Cooldown removed: {} {} (user {}, profile {})",
+            cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
+        );
+        let reaction = ReactionType::Unicode("✅".to_string());
+        message.delete_reaction(ctx, None, reaction).await?;
+    }
+    Ok(())
+}
+
+async fn extract_message_cooldowns(
+    message: &Message,
+    user_id: UserId,
+    data: &Data,
+) -> Result<Vec<Cooldown>> {
     let mut cooldown_kinds = vec![];
     if let Some(timestamp) = extract_rescue_cooldown(message) {
         cooldown_kinds.push((CooldownKind::Rescue, timestamp));
@@ -176,7 +245,7 @@ async fn check_cooldown_message<'a>(
         cooldown_kinds.push((CooldownKind::Profile, timestamp));
     }
     if cooldown_kinds.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
     let profile = fetch_zoo_profile(&data.client, user_id.get(), None)
         .await
@@ -192,7 +261,132 @@ async fn check_cooldown_message<'a>(
             timestamp,
         })
         .collect::<Vec<_>>();
-    handle_cooldowns(ctx, message, &cooldowns, data).await
+    Ok(cooldowns)
+}
+
+async fn check_cooldown_message<'a>(
+    ctx: &'a SerenityContext,
+    message: &Message,
+    data: &'a Data,
+) -> Result<()> {
+    if message.author.id != ZOO_USER_ID {
+        return Ok(());
+    }
+    let Some(interaction) = message.interaction.as_deref() else {
+        return Ok(());
+    };
+    let user_id = interaction.user.id;
+    let config = data.config.read().await;
+    if config.disabled_users.contains(&user_id) {
+        return Ok(());
+    }
+    let manual = config.manual_users.contains(&user_id);
+    drop(config);
+    let cooldowns = extract_message_cooldowns(message, user_id, data).await?;
+    if cooldowns.is_empty() {
+        return Ok(());
+    }
+    if manual {
+        advertise_cooldowns(ctx, message, &cooldowns, data).await
+    } else {
+        add_cooldowns(ctx, message, &cooldowns, data).await
+    }
+}
+
+async fn handle_reaction<'a>(
+    ctx: &'a SerenityContext,
+    add_reaction: &Reaction,
+    data: &'a Data,
+    add: bool,
+) -> Result<()> {
+    if add_reaction.member.as_ref().is_some_and(|m| m.user.bot) {
+        return Ok(());
+    }
+    let Some(user_id) = add_reaction.user_id else {
+        return Ok(());
+    };
+    let ReactionType::Unicode(emoji) = &add_reaction.emoji else {
+        return Ok(());
+    };
+    let message = add_reaction.message(ctx).await.context("Fetching message for reaction")?;
+    if message.author.id != ZOO_USER_ID {
+        return Ok(());
+    }
+    let Some(interaction) = message.interaction.as_deref() else {
+        return Ok(());
+    };
+    if user_id != interaction.user.id {
+        return Ok(());
+    }
+    for cooldown in extract_message_cooldowns(&message, user_id, data).await? {
+        if cooldown.kind.emoji() == emoji {
+            if add {
+                add_cooldowns(ctx, &message, &[cooldown], data).await?;
+            } else {
+                remove_cooldowns(ctx, &message, &[cooldown], data).await?;
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_interaction<'a>(
+    ctx: &'a SerenityContext,
+    interaction: &'a Interaction,
+    data: &'a Data,
+) -> Result<()> {
+    if let Interaction::Component(component) = interaction {
+        let Some(interaction) = component.message.interaction.as_deref() else {
+            return Ok(());
+        };
+        if interaction.user.id != component.user.id {
+            component
+                .create_response(
+                    ctx,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You can't do that!")
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+        match component.data.custom_id.as_str() {
+            "disable" | "enable" | "auto" | "manual" | "all" => {
+                let mut config = data.config.write().await;
+                if component.data.custom_id == "enable" {
+                    config.disabled_users.remove(&component.user.id);
+                } else if component.data.custom_id == "disable" {
+                    config.disabled_users.insert(component.user.id);
+                } else if component.data.custom_id == "auto" {
+                    config.manual_users.remove(&component.user.id);
+                } else if component.data.custom_id == "manual" {
+                    config.manual_users.insert(component.user.id);
+                }
+                save_config(&config).await?;
+                let (message, components) = create_cooldowns_message(
+                    &config,
+                    None,
+                    component.data.custom_id == "all",
+                    component.user.id,
+                    component.channel_id,
+                );
+                drop(config);
+                let message =
+                    CreateInteractionResponseMessage::new().components(components).content(message);
+                component
+                    .create_response(ctx, CreateInteractionResponse::UpdateMessage(message))
+                    .await?;
+            }
+            _ => {
+                warn!("Unknown interaction component ID: {}", component.data.custom_id);
+                component.create_response(ctx, CreateInteractionResponse::Acknowledge).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn event_handler<'a>(
@@ -202,10 +396,28 @@ async fn event_handler<'a>(
     data: &'a Data,
 ) -> Result<()> {
     // debug!("Event: {:?}", event);
-    if let FullEvent::Message { new_message: message } = event {
-        if let Err(e) = check_cooldown_message(ctx, message, data).await {
-            error!("Error handling message: {:?}", e);
+    match event {
+        FullEvent::Message { new_message: message } => {
+            if let Err(e) = check_cooldown_message(ctx, message, data).await {
+                error!("Error handling message: {:?}", e);
+            }
         }
+        FullEvent::ReactionAdd { add_reaction } => {
+            if let Err(e) = handle_reaction(ctx, add_reaction, data, true).await {
+                error!("Error handling reaction: {:?}", e);
+            }
+        }
+        FullEvent::ReactionRemove { removed_reaction } => {
+            if let Err(e) = handle_reaction(ctx, removed_reaction, data, false).await {
+                error!("Error handling reaction: {:?}", e);
+            }
+        }
+        FullEvent::InteractionCreate { interaction } => {
+            if let Err(e) = handle_interaction(ctx, interaction, data).await {
+                error!("Error handling interaction: {:?}", e);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -213,25 +425,39 @@ async fn event_handler<'a>(
 /// View some details about the bot
 #[command(slash_command, ephemeral)]
 async fn botstatus(ctx: Context<'_>) -> Result<(), Error> {
-    let config = ctx.data().config.lock().await;
+    let ping = ctx.ping().await;
+    let data = ctx.data();
+    let config = data.config.read().await;
     let memory = memory_stats::memory_stats()
         .map(|s| human_bytes::human_bytes(s.physical_mem as f64))
         .unwrap_or_else(|| "<unknown>".to_string());
+    let mut author = CreateEmbedAuthor::new(data.current_user.name.clone());
+    if let Some(avatar_url) = data.current_user.avatar_url() {
+        author = author.icon_url(avatar_url);
+    }
+    let mut description = String::new();
+    for owner in &config.owners {
+        if let Ok(user) = owner.to_user(ctx).await {
+            description.push_str(&format!("**Created by:** {}\n", user.name));
+        }
+    }
+    description.push_str(&format!("**Version:** v{}\n", env!("CARGO_PKG_VERSION")));
+    description.push_str(&format!(
+        "**Shard:** {}\n",
+        data.shard.map_or("unknown".to_string(), |s| format!("{}/{}", s.id.0 + 1, s.total))
+    ));
+    description.push_str(&format!(
+        "**Uptime:** {}\n",
+        FormattedTimestamp::new(data.start_time, Some(FormattedTimestampStyle::RelativeTime))
+    ));
+    description.push_str(&format!("**Rust version:** v{}\n", env!("VERGEN_RUSTC_SEMVER")));
+    description.push_str(&format!("**Memory usage:** {}\n", memory));
+    description.push_str(&format!("**Tracked cooldowns:** {}\n", config.cooldowns.len()));
     let embed = CreateEmbed::default()
-        .author(CreateEmbedAuthor::new("Zookeeper").icon_url("https://cdn.discordapp.com/avatars/1221853228115693608/40b9e887ade5ce25f5e14112c6f5e6fb"))
-        .description(format!(
-            "**Created by:** encounter\n\
-            **Version:** v{}\n\
-            **Uptime:** {}\n\
-            **Rust version:** v{}\n\
-            **Memory usage:** {}\n\
-            **Tracked cooldowns:** {}",
-            env!("CARGO_PKG_VERSION"),
-            FormattedTimestamp::new(ctx.data().start_time, Some(FormattedTimestampStyle::RelativeTime)),
-            env!("VERGEN_RUSTC_SEMVER"),
-            memory,
-            config.cooldowns.len()
-        ));
+        .author(author)
+        .description(description)
+        .footer(CreateEmbedFooter::new(format!("Ping: {}ms", ping.as_millis())));
+    drop(config);
     ctx.send(CreateReply::default().embed(embed)).await?;
     Ok(())
 }
@@ -242,8 +468,21 @@ async fn cooldowns(
     ctx: Context<'_>,
     #[description = "Selected user"] user: Option<User>,
 ) -> Result<(), Error> {
-    let config = ctx.data().config.lock().await;
-    let show_all = user.is_none() && ctx.framework().options.owners.contains(&ctx.author().id);
+    let config = ctx.data().config.read().await;
+    let (message, components) =
+        create_cooldowns_message(&config, user, false, ctx.author().id, ctx.channel_id());
+    drop(config);
+    ctx.send(CreateReply::default().content(message).components(components)).await?;
+    Ok(())
+}
+
+fn create_cooldowns_message(
+    config: &Config,
+    user: Option<User>,
+    show_all: bool,
+    current_user: UserId,
+    current_channel: ChannelId,
+) -> (String, Vec<CreateActionRow>) {
     let mut cooldowns = config
         .cooldowns
         .iter()
@@ -251,8 +490,8 @@ async fn cooldowns(
             if let Some(user) = &user {
                 cooldown.user_id == user.id
             } else {
-                cooldown.user_id == ctx.author().id
-                    || (show_all && cooldown.channel_id == ctx.channel_id())
+                cooldown.user_id == current_user
+                    || (show_all && cooldown.channel_id == current_channel)
             }
         })
         .collect::<Vec<_>>();
@@ -261,7 +500,7 @@ async fn cooldowns(
         if let Some(user) = &user {
             format!("No cooldowns tracked for {}.", user.mention())
         } else if show_all {
-            format!("No cooldowns tracked in {}.", ctx.channel_id().mention())
+            format!("No cooldowns tracked in {}.", current_channel.mention())
         } else {
             "No cooldowns tracked. Use Zoo `/rescue` to start.".to_string()
         }
@@ -269,7 +508,7 @@ async fn cooldowns(
         let mut output = if let Some(user) = &user {
             format!("Cooldowns tracked for {}:\n", user.mention())
         } else if show_all {
-            format!("Cooldowns tracked in {}:\n", ctx.channel_id().mention())
+            format!("Cooldowns tracked in {}:\n", current_channel.mention())
         } else {
             "Your tracked cooldowns:\n".to_string()
         };
@@ -291,31 +530,59 @@ async fn cooldowns(
     };
 
     if let Some(user) = &user {
+        if config.manual_users.contains(&user.id) {
+            message = format!("Auto mode: **disabled** ❌\n{}", message);
+        } else {
+            message = format!("Auto mode: **enabled** ✅\n{}", message);
+        }
+    } else if config.manual_users.contains(&current_user) {
+        message = format!("Auto mode: **disabled** ❌\n{}", message);
+    } else {
+        message = format!("Auto mode: **enabled** ✅\n{}", message);
+    }
+
+    if let Some(user) = &user {
         if config.disabled_users.contains(&user.id) {
             message = format!("Tracking & notifications: **disabled** ❌\n{}", message);
         } else {
             message = format!("Tracking & notifications: **enabled** ✅\n{}", message);
         }
-    } else if !show_all {
-        if config.disabled_users.contains(&ctx.author().id) {
-            message = format!("Tracking & notifications: **disabled** ❌\n{}", message);
-        } else {
-            message = format!("Tracking & notifications: **enabled** ✅\n{}", message);
-        }
+    } else if config.disabled_users.contains(&current_user) {
+        message = format!("Tracking & notifications: **disabled** ❌\n{}", message);
+    } else {
+        message = format!("Tracking & notifications: **enabled** ✅\n{}", message);
     }
 
-    ctx.say(message).await?;
-    Ok(())
+    let mut components = vec![];
+    if user.is_none() {
+        let mut buttons = vec![];
+        if config.disabled_users.contains(&current_user) {
+            buttons.push(CreateButton::new("enable").label("Enable").style(ButtonStyle::Success));
+        } else {
+            buttons.push(CreateButton::new("disable").label("Disable").style(ButtonStyle::Danger));
+        }
+        if config.manual_users.contains(&current_user) {
+            buttons.push(CreateButton::new("auto").label("Auto mode").style(ButtonStyle::Primary));
+        } else {
+            buttons.push(
+                CreateButton::new("manual").label("Manual mode").style(ButtonStyle::Secondary),
+            );
+        }
+        if !show_all && config.owners.contains(&current_user) {
+            buttons.push(CreateButton::new("all").label("Show all").style(ButtonStyle::Secondary));
+        }
+        components.push(CreateActionRow::Buttons(buttons));
+    }
+    (message, components)
 }
 
 /// Disable bot tracking and notifications
 #[command(slash_command, ephemeral)]
 async fn disable(ctx: Context<'_>) -> Result<(), Error> {
-    {
-        let mut config = ctx.data().config.lock().await;
-        config.disabled_users.insert(ctx.author().id);
-        save_config(&config).await?;
-    }
+    let mut config = ctx.data().config.write().await;
+    config.disabled_users.insert(ctx.author().id);
+    save_config(&config).await?;
+    drop(config);
     ctx.say("No longer tracking your cooldowns or sending notifications.\nUse `/enable` to start again.")
         .await?;
     Ok(())
@@ -324,11 +591,10 @@ async fn disable(ctx: Context<'_>) -> Result<(), Error> {
 /// Enable bot tracking and notifications
 #[command(slash_command, ephemeral)]
 async fn enable(ctx: Context<'_>) -> Result<(), Error> {
-    {
-        let mut config = ctx.data().config.lock().await;
-        config.disabled_users.remove(&ctx.author().id);
-        save_config(&config).await?;
-    }
+    let mut config = ctx.data().config.write().await;
+    config.disabled_users.remove(&ctx.author().id);
+    save_config(&config).await?;
+    drop(config);
     ctx.say("Tracking your cooldowns and sending notifications.\nUse `/disable` to stop.").await?;
     Ok(())
 }
@@ -359,9 +625,28 @@ fn format_cooldown(cooldown: &Cooldown) -> String {
     }
 }
 
-async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error> {
+struct MyCacheHttp {
+    cache: Arc<Cache>,
+    http: Arc<Http>,
+}
+
+impl MyCacheHttp {
+    fn new(client: &Client) -> Self {
+        Self { cache: client.cache.clone(), http: client.http.clone() }
+    }
+}
+
+impl CacheHttp for MyCacheHttp {
+    fn http(&self) -> &Http { &self.http }
+
+    fn cache(&self) -> Option<&Arc<Cache>> { Some(&self.cache) }
+}
+
+async fn run_notifications(config: &RwLock<Config>, http: &MyCacheHttp) -> Result<(), Error> {
+    let mut config = config.write().await;
     let now = Timestamp::now();
     let mut any_expired = false;
+    let mut messages = vec![];
     for cooldown in &config.cooldowns {
         if now >= cooldown.timestamp {
             info!(
@@ -394,14 +679,18 @@ async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error
                     cooldown.profile
                 )
             };
-            if let Err(e) = cooldown.channel_id.say(http, &message).await {
-                error!("Failed to send message: {:?}", e);
-            }
+            messages.push((cooldown.channel_id, message));
         }
     }
     if any_expired {
         config.cooldowns.retain(|cooldown| now < cooldown.timestamp);
-        save_config(config).await?;
+        save_config(&config).await?;
+    }
+    drop(config);
+    for (channel_id, message) in messages {
+        if let Err(e) = channel_id.say(http, &message).await {
+            error!("Failed to send message: {:?}", e);
+        }
     }
     Ok(())
 }
@@ -416,8 +705,10 @@ async fn main() {
     }
     let api_token = config.token.clone();
     let owners = HashSet::from_iter(config.owners.iter().cloned());
-    let config = Arc::new(Mutex::new(config));
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let config = Arc::new(RwLock::new(config));
+    let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_MESSAGE_REACTIONS
+        | GatewayIntents::MESSAGE_CONTENT;
 
     let cloned_config = config.clone();
     let framework = Framework::builder()
@@ -438,13 +729,19 @@ async fn main() {
             owners,
             ..Default::default()
         })
-        .setup(|ctx, _ready, framework| {
+        .setup(|ctx, ready, framework| {
             Box::pin(async move {
+                ctx.set_presence(
+                    Some(ActivityData::custom("/cooldowns")),
+                    OnlineStatus::DoNotDisturb,
+                );
                 register_globally(ctx, &framework.options().commands).await?;
                 Ok(Data {
                     start_time: Timestamp::now(),
                     config: cloned_config,
                     client: reqwest::Client::new(),
+                    current_user: ready.user.clone(),
+                    shard: ready.shard,
                 })
             })
         })
@@ -456,7 +753,7 @@ async fn main() {
     let token = CancellationToken::new();
     let cloned_token = token.clone();
     let cloned_config = config.clone();
-    let http = client.http.clone();
+    let cache_http = MyCacheHttp::new(&client);
     tracker.spawn(task::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(1000));
         loop {
@@ -464,8 +761,7 @@ async fn main() {
                 _ = cloned_token.cancelled() => break,
                 _ = interval.tick() => {},
             }
-            let mut config = cloned_config.lock().await;
-            match run_notifications(&mut config, &http).await {
+            match run_notifications(&cloned_config, &cache_http).await {
                 Ok(()) => {}
                 Err(e) => {
                     error!("Error running notifications: {:?}", e);
@@ -485,13 +781,13 @@ async fn main() {
     });
 
     info!("Starting client...");
-    if let Err(why) = client.start().await {
+    if let Err(why) = client.start_autosharded().await {
         error!("Client error: {:?}", why);
     }
     info!("Shutting down gracefully...");
     token.cancel();
     tracker.close();
     tracker.wait().await;
-    let guard = config.lock_owned().await;
+    let guard = config.read().await;
     save_config(&guard).await.unwrap();
 }

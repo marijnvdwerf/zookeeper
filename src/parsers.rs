@@ -1,54 +1,29 @@
+use std::{ops::Add, time::Duration};
+
 use const_format::concatcp;
 use once_cell::sync::Lazy;
 use poise::serenity_prelude::{Message, Timestamp};
 use regex::Regex;
-use std::ops::Add;
-use std::time::Duration;
 
 const DURATION_PATTERN: &str = r"(?:(\d)+d \+ )?(?:(\d+):)?(\d+):(\d+)";
 static RESCUE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concatcp!(
-        r"another animal in \*\*",
-        DURATION_PATTERN,
-        r"\*\*"
-    ))
-    .unwrap()
+    Regex::new(concatcp!(r"another animal in \*\*", DURATION_PATTERN, r"\*\*")).unwrap()
 });
 static RESCUE_MODIFIER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(concatcp!("finishes in ", DURATION_PATTERN)).unwrap());
 static RESCUE_TODO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concatcp!(
-        r"Next Rescue: \*\*",
-        DURATION_PATTERN,
-        r"\*\* \(<t:(\d+)>\)"
-    ))
-    .unwrap()
+    Regex::new(concatcp!(r"Next Rescue: \*\*", DURATION_PATTERN, r"\*\* \(<t:(\d+)>\)")).unwrap()
 });
 
 static QUEST_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concatcp!(
-        r"quest will finish in \*\*",
-        DURATION_PATTERN,
-        r"\*\*"
-    ))
-    .unwrap()
+    Regex::new(concatcp!(r"quest will finish in \*\*", DURATION_PATTERN, r"\*\*")).unwrap()
 });
 static QUEST_TODO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concatcp!(
-        r"Quest Finishes: \*\*",
-        DURATION_PATTERN,
-        r"\*\* \(<t:(\d+)>\)"
-    ))
-    .unwrap()
+    Regex::new(concatcp!(r"Quest Finishes: \*\*", DURATION_PATTERN, r"\*\* \(<t:(\d+)>\)")).unwrap()
 });
 
 static CARD_TODO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concatcp!(
-        r"Next Card Pull: \*\*",
-        DURATION_PATTERN,
-        r"\*\* \(<t:(\d+)>\)"
-    ))
-    .unwrap()
+    Regex::new(concatcp!(r"Next Card Pull: \*\*", DURATION_PATTERN, r"\*\* \(<t:(\d+)>\)")).unwrap()
 });
 
 static PROFILE_RE: Lazy<Regex> =
@@ -79,9 +54,8 @@ pub fn extract_rescue_cooldown(message: &Message) -> Option<Timestamp> {
     }
 
     // Regular message
-    if let Some(duration) = RESCUE_RE
-        .captures(&message.content)
-        .and_then(|captures| parse_duration_captures(captures))
+    if let Some(duration) =
+        RESCUE_RE.captures(&message.content).and_then(|captures| parse_duration_captures(captures))
     {
         return Some(Timestamp::from(message.timestamp.add(duration)));
     }
@@ -131,9 +105,8 @@ pub fn extract_quest_cooldown(message: &Message) -> Option<Timestamp> {
     }
 
     // Regular message
-    if let Some(duration) = QUEST_RE
-        .captures(&message.content)
-        .and_then(|captures| parse_duration_captures(captures))
+    if let Some(duration) =
+        QUEST_RE.captures(&message.content).and_then(|captures| parse_duration_captures(captures))
     {
         return Some(Timestamp::from(message.timestamp.add(duration)));
     }
@@ -199,26 +172,19 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
 }
 
 pub fn parse_duration_captures(captures: regex::Captures) -> Option<Duration> {
-    let days: u64 = captures
-        .get(1)
-        .and_then(|s| s.as_str().parse().ok())
-        .unwrap_or(0);
-    let hours: u64 = captures
-        .get(2)
-        .and_then(|s| s.as_str().parse().ok())
-        .unwrap_or(0);
+    let days: u64 = captures.get(1).and_then(|s| s.as_str().parse().ok()).unwrap_or(0);
+    let hours: u64 = captures.get(2).and_then(|s| s.as_str().parse().ok()).unwrap_or(0);
     let minutes: u64 = captures[3].parse().ok()?;
     let seconds: u64 = captures[4].parse().ok()?;
-    Some(Duration::from_secs(
-        days * 86400 + hours * 3600 + minutes * 60 + seconds,
-    ))
+    Some(Duration::from_secs(days * 86400 + hours * 3600 + minutes * 60 + seconds))
 }
 
 #[cfg(test)]
 mod tests {
+    use serenity::model::prelude::{Embed, EmbedField};
+
     use super::*;
     use crate::ZOO_USER_ID;
-    use poise::serenity_prelude::{Embed, EmbedField};
 
     #[test]
     fn test_parse_duration() {
@@ -226,14 +192,8 @@ mod tests {
             parse_duration("1d + 2:03:04"),
             Some(Duration::from_secs(86400 + 2 * 3600 + 3 * 60 + 4))
         );
-        assert_eq!(
-            parse_duration("10:25:53"),
-            Some(Duration::from_secs(10 * 3600 + 25 * 60 + 53))
-        );
-        assert_eq!(
-            parse_duration("36:58"),
-            Some(Duration::from_secs(36 * 60 + 58))
-        );
+        assert_eq!(parse_duration("10:25:53"), Some(Duration::from_secs(10 * 3600 + 25 * 60 + 53)));
+        assert_eq!(parse_duration("36:58"), Some(Duration::from_secs(36 * 60 + 58)));
     }
 
     #[test]
@@ -241,9 +201,7 @@ mod tests {
         let mut message = Message::default();
         message.author.id = ZOO_USER_ID;
         let mut embed = Embed::default();
-        embed
-            .fields
-            .push(EmbedField::new("🕓 Cooldown", "1d + 2:03:04", false));
+        embed.fields.push(EmbedField::new("🕓 Cooldown", "1d + 2:03:04", false));
         message.embeds.push(embed);
         assert_eq!(
             extract_rescue_cooldown(&message),
@@ -297,9 +255,7 @@ __**Upcoming Events**__
         let mut message = Message::default();
         message.author.id = ZOO_USER_ID;
         let mut embed = Embed::default();
-        embed
-            .fields
-            .push(EmbedField::new("🌲 Quest ends", "1d + 2:03:04", false));
+        embed.fields.push(EmbedField::new("🌲 Quest ends", "1d + 2:03:04", false));
         message.embeds.push(embed);
         assert_eq!(
             extract_quest_cooldown(&message),

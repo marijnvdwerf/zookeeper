@@ -68,14 +68,35 @@ pub struct ZooProfileActiveQuest {
     pub family: String,
 }
 
-// TODO
-// #[derive(Debug, Clone, serde::Deserialize)]
-// struct ZooProfileCurse {
-//     name: String,
-//     emoji: String,
-//     description: String,
-//     days: u32,
-// }
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileCurse {
+    pub name: String,
+    pub names: ZooProfileCurseNames,
+    pub weak: bool,
+    pub effects: ZooProfileCurseEffects,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileCurseNames {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub cure: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileCurseEffects {
+    #[serde(rename = "type")]
+    pub kind: ZooProfileCurseEffect,
+    pub cure: ZooProfileCurseEffect,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileCurseEffect {
+    pub name: String,
+    pub description: String,
+    // TODO nullable?
+    // pub weak: bool,
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ZooProfileTerminalFishy {
@@ -234,7 +255,7 @@ pub struct ZooProfileResponse {
     pub leaders: Vec<ZooProfileLeader>,
     pub quests: Vec<ZooProfileQuest>,
     pub quest: Option<ZooProfileActiveQuest>,
-    // pub curse: Option<ZooProfileCurse>,
+    pub curse: Option<ZooProfileCurse>,
     pub terminal: ZooProfileTerminal,
     // pub stats: Vec<ZooProfileStat>,
     pub goals: Vec<ZooProfileGoal>,
@@ -257,10 +278,7 @@ pub fn profile_url(user_id: u64, profile: Option<&str>) -> String {
 
 pub fn profile_api_url(user_id: u64, profile: Option<&str>) -> String {
     if let Some(profile) = profile {
-        format!(
-            "https://gdcolon.com/zoo/api/profile/{}_{}",
-            user_id, profile
-        )
+        format!("https://gdcolon.com/zoo/api/profile/{}_{}", user_id, profile)
     } else {
         format!("https://gdcolon.com/zoo/api/profile/{}", user_id)
     }

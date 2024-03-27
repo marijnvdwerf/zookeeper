@@ -1,34 +1,41 @@
-use chrono::TimeDelta;
-use std::collections::{BTreeSet, HashSet};
-use std::fmt::Display;
-use std::ops::Sub;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt::Display,
+    ops::Sub,
+    sync::Arc,
+    time::Duration,
+};
 
-use poise::{serenity_prelude as serenity, CreateReply};
+use anyhow::{Context as _, Error, Result};
+use chrono::TimeDelta;
+use poise::{builtins::register_globally, command, CreateReply, Framework, FrameworkOptions};
 use serenity::{
-    ChannelId, CreateEmbed, CreateEmbedAuthor, FormattedTimestamp, FormattedTimestampStyle,
-    FullEvent, Http, Mentionable, Message, ReactionType, Timestamp, UserId,
+    builder::{CreateEmbed, CreateEmbedAuthor},
+    client::{ClientBuilder, Context as SerenityContext, FullEvent},
+    http::Http,
+    model::prelude::*,
+    utils::{FormattedTimestamp, FormattedTimestampStyle},
 };
 use tokio::{select, sync::Mutex, task, time};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{error, info};
+
+mod parsers;
+mod zoo;
 
 use parsers::{
     extract_card_cooldown, extract_profile_cooldown, extract_quest_cooldown,
     extract_rescue_cooldown,
 };
-use zoo::{fetch_zoo_profile, profile_url, ZooProfileResponse};
-
-mod parsers;
-mod zoo;
+use zoo::{fetch_zoo_profile, profile_url};
 
 struct Data {
     start_time: Timestamp,
     config: Arc<Mutex<Config>>,
     client: reqwest::Client,
 }
-type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
+type FrameworkContext<'a> = poise::FrameworkContext<'a, Data, Error>;
 
 const ZOO_USER_ID: UserId = UserId::new(1008563327380766812);
 
@@ -74,25 +81,6 @@ struct Cooldown {
     timestamp: Timestamp,
 }
 
-impl Cooldown {
-    fn new(
-        kind: CooldownKind,
-        message: &Message,
-        profile: &ZooProfileResponse,
-        timestamp: Timestamp,
-    ) -> Self {
-        let user_id = message.interaction.as_ref().unwrap().user.id;
-        Self {
-            kind,
-            channel_id: message.channel_id,
-            user_id,
-            profile: profile.profile_id.clone(),
-            profile_name: profile.name.clone(),
-            timestamp,
-        }
-    }
-}
-
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct Config {
@@ -102,27 +90,31 @@ struct Config {
     disabled_users: BTreeSet<UserId>,
 }
 
-async fn load_config() -> Result<Config, Error> {
+async fn load_config() -> Result<Config> {
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
     if tokio::fs::metadata(&config_path).await.is_err() {
         return Ok(Config::default());
     }
-    let config_str = tokio::fs::read_to_string(config_path).await?;
-    Ok(toml::from_str(&config_str)?)
+    let config_str = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read config file {}", config_path))?;
+    toml::from_str(&config_str).context("Failed to deserialize config")
 }
 
-async fn save_config(config: &Config) -> Result<(), Error> {
+async fn save_config(config: &Config) -> Result<()> {
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-    tokio::fs::write(config_path, toml::to_string(config)?).await?;
-    Ok(())
+    let string = toml::to_string(config).context("Failed to serialize config")?;
+    tokio::fs::write(&config_path, string)
+        .await
+        .with_context(|| format!("Failed to write to {}", config_path))
 }
 
 async fn handle_cooldowns(
-    ctx: &serenity::Context,
+    ctx: &SerenityContext,
     message: &Message,
     cooldowns: &[Cooldown],
     data: &Data,
-) -> Result<(), Error> {
+) -> Result<()> {
     {
         let mut config = data.config.lock().await;
         for cooldown in cooldowns {
@@ -142,115 +134,84 @@ async fn handle_cooldowns(
         save_config(&config).await?;
     }
     for cooldown in cooldowns {
-        println!(
+        info!(
             "Cooldown captured: {} {} (user {}, profile {})",
             cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
         );
-        message
-            .react(
-                ctx,
-                ReactionType::Unicode(cooldown.kind.emoji().to_string()),
-            )
-            .await?;
+        let reaction = ReactionType::Unicode(cooldown.kind.emoji().to_string());
+        message.react(ctx, reaction).await?;
     }
     Ok(())
 }
 
-async fn event_handler<'a>(
-    ctx: &'a serenity::Context,
-    event: &'a FullEvent,
-    _framework: poise::FrameworkContext<'a, Data, Error>,
+async fn check_cooldown_message<'a>(
+    ctx: &'a SerenityContext,
+    message: &Message,
     data: &'a Data,
-) -> Result<(), Error> {
-    // println!("Event: {:?}", event);
-    if let FullEvent::Message {
-        new_message: message,
-    } = event
+) -> Result<()> {
+    if message.author.id != ZOO_USER_ID {
+        return Ok(());
+    }
+    let Some(interaction) = message.interaction.as_deref() else {
+        return Ok(());
+    };
+    let user_id = interaction.user.id;
     {
-        if message.author.id != ZOO_USER_ID {
+        let config = data.config.lock().await;
+        if config.disabled_users.contains(&user_id) {
             return Ok(());
         }
-        let Some(interaction) = message.interaction.as_deref() else {
-            return Ok(());
-        };
-        {
-            let config = data.config.lock().await;
-            if config.disabled_users.contains(&interaction.user.id) {
-                return Ok(());
-            }
-        }
-        let mut rescue_cooldown = None;
-        let mut card_cooldown = None;
-        let mut quest_cooldown = None;
-        let mut profile_cooldown = None;
-        if let Some(timestamp) = extract_rescue_cooldown(message) {
-            rescue_cooldown = Some(timestamp);
-        }
-        if let Some(timestamp) = extract_card_cooldown(message) {
-            card_cooldown = Some(timestamp);
-        }
-        if let Some(timestamp) = extract_quest_cooldown(message) {
-            quest_cooldown = Some(timestamp);
-        }
-        if let Some(timestamp) = extract_profile_cooldown(message) {
-            profile_cooldown = Some(timestamp);
-        }
-        if rescue_cooldown.is_none()
-            && quest_cooldown.is_none()
-            && card_cooldown.is_none()
-            && profile_cooldown.is_none()
-        {
-            return Ok(());
-        }
-        let profile = match fetch_zoo_profile(&data.client, interaction.user.id.get(), None).await {
-            Ok(response) => response,
-            Err(e) => {
-                eprintln!("Failed to fetch profile {}: {:?}", interaction.user.id, e);
-                return Ok(());
-            }
-        };
-        let mut cooldowns = vec![];
-        if let Some(timestamp) = rescue_cooldown {
-            cooldowns.push(Cooldown::new(
-                CooldownKind::Rescue,
-                message,
-                &profile,
-                timestamp,
-            ));
-        }
-        if let Some(timestamp) = card_cooldown {
-            cooldowns.push(Cooldown::new(
-                CooldownKind::Card,
-                message,
-                &profile,
-                timestamp,
-            ));
-        }
-        if let Some(timestamp) = quest_cooldown {
-            cooldowns.push(Cooldown::new(
-                CooldownKind::Quest,
-                message,
-                &profile,
-                timestamp,
-            ));
-        }
-        if let Some(timestamp) = profile_cooldown {
-            cooldowns.push(Cooldown::new(
-                CooldownKind::Profile,
-                message,
-                &profile,
-                timestamp,
-            ));
-        }
-        if let Err(e) = handle_cooldowns(ctx, message, &cooldowns, data).await {
-            println!("Error handling cooldown message: {:?}", e);
+    }
+    let mut cooldown_kinds = vec![];
+    if let Some(timestamp) = extract_rescue_cooldown(message) {
+        cooldown_kinds.push((CooldownKind::Rescue, timestamp));
+    }
+    if let Some(timestamp) = extract_card_cooldown(message) {
+        cooldown_kinds.push((CooldownKind::Card, timestamp));
+    }
+    if let Some(timestamp) = extract_quest_cooldown(message) {
+        cooldown_kinds.push((CooldownKind::Quest, timestamp));
+    }
+    if let Some(timestamp) = extract_profile_cooldown(message) {
+        cooldown_kinds.push((CooldownKind::Profile, timestamp));
+    }
+    if cooldown_kinds.is_empty() {
+        return Ok(());
+    }
+    let profile = fetch_zoo_profile(&data.client, user_id.get(), None)
+        .await
+        .with_context(|| format!("Failed to fetch profile for user ID {}", user_id.get()))?;
+    let cooldowns = cooldown_kinds
+        .into_iter()
+        .map(|(kind, timestamp)| Cooldown {
+            kind,
+            channel_id: message.channel_id,
+            user_id,
+            profile: profile.profile_id.clone(),
+            profile_name: profile.name.clone(),
+            timestamp,
+        })
+        .collect::<Vec<_>>();
+    handle_cooldowns(ctx, message, &cooldowns, data).await
+}
+
+async fn event_handler<'a>(
+    ctx: &'a SerenityContext,
+    event: &'a FullEvent,
+    _framework: FrameworkContext<'a>,
+    data: &'a Data,
+) -> Result<()> {
+    // debug!("Event: {:?}", event);
+    if let FullEvent::Message { new_message: message } = event {
+        if let Err(e) = check_cooldown_message(ctx, message, data).await {
+            error!("Error handling message: {:?}", e);
         }
     }
     Ok(())
 }
 
 /// View some details about the bot
-#[poise::command(slash_command, ephemeral)]
+#[command(slash_command, ephemeral)]
 async fn botstatus(ctx: Context<'_>) -> Result<(), Error> {
     let config = ctx.data().config.lock().await;
     let memory = memory_stats::memory_stats()
@@ -267,7 +228,7 @@ async fn botstatus(ctx: Context<'_>) -> Result<(), Error> {
             **Tracked cooldowns:** {}",
             env!("CARGO_PKG_VERSION"),
             FormattedTimestamp::new(ctx.data().start_time, Some(FormattedTimestampStyle::RelativeTime)),
-            "1.76", // TODO make it real
+            env!("VERGEN_RUSTC_SEMVER"),
             memory,
             config.cooldowns.len()
         ));
@@ -276,10 +237,10 @@ async fn botstatus(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// List all tracked cooldowns
-#[poise::command(slash_command, ephemeral)]
+#[command(slash_command, ephemeral)]
 async fn cooldowns(
     ctx: Context<'_>,
-    #[description = "Selected user"] user: Option<serenity::User>,
+    #[description = "Selected user"] user: Option<User>,
 ) -> Result<(), Error> {
     let config = ctx.data().config.lock().await;
     let show_all = user.is_none() && ctx.framework().options.owners.contains(&ctx.author().id);
@@ -348,7 +309,7 @@ async fn cooldowns(
 }
 
 /// Disable bot tracking and notifications
-#[poise::command(slash_command, ephemeral)]
+#[command(slash_command, ephemeral)]
 async fn disable(ctx: Context<'_>) -> Result<(), Error> {
     {
         let mut config = ctx.data().config.lock().await;
@@ -361,15 +322,14 @@ async fn disable(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Enable bot tracking and notifications
-#[poise::command(slash_command, ephemeral)]
+#[command(slash_command, ephemeral)]
 async fn enable(ctx: Context<'_>) -> Result<(), Error> {
     {
         let mut config = ctx.data().config.lock().await;
         config.disabled_users.remove(&ctx.author().id);
         save_config(&config).await?;
     }
-    ctx.say("Tracking your cooldowns and sending notifications.\nUse `/disable` to stop.")
-        .await?;
+    ctx.say("Tracking your cooldowns and sending notifications.\nUse `/disable` to stop.").await?;
     Ok(())
 }
 
@@ -404,7 +364,7 @@ async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error
     let mut any_expired = false;
     for cooldown in &config.cooldowns {
         if now >= cooldown.timestamp {
-            println!(
+            info!(
                 "{} cooldown finished: {} (user {}, profile {})",
                 cooldown.kind, cooldown.timestamp, cooldown.user_id, cooldown.profile
             );
@@ -435,7 +395,7 @@ async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error
                 )
             };
             if let Err(e) = cooldown.channel_id.say(http, &message).await {
-                eprintln!("Failed to send message: {:?}", e);
+                error!("Failed to send message: {:?}", e);
             }
         }
     }
@@ -448,6 +408,8 @@ async fn run_notifications(config: &mut Config, http: &Http) -> Result<(), Error
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let mut config = load_config().await.unwrap();
     if config.token.is_empty() {
         config.token = std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
@@ -455,18 +417,17 @@ async fn main() {
     let api_token = config.token.clone();
     let owners = HashSet::from_iter(config.owners.iter().cloned());
     let config = Arc::new(Mutex::new(config));
-    let intents =
-        serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
 
     let cloned_config = config.clone();
-    let framework = poise::Framework::builder()
-        .options(poise::FrameworkOptions {
+    let framework = Framework::builder()
+        .options(FrameworkOptions {
             commands: vec![botstatus(), cooldowns(), disable(), enable()],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
             pre_command: |ctx| {
-                println!(
+                info!(
                     "User {} ({}) used: {}",
                     ctx.author().name,
                     ctx.author().id,
@@ -479,20 +440,17 @@ async fn main() {
         })
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
-                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                register_globally(ctx, &framework.options().commands).await?;
                 Ok(Data {
                     start_time: Timestamp::now(),
                     config: cloned_config,
-                    client: reqwest::ClientBuilder::new().build()?,
+                    client: reqwest::Client::new(),
                 })
             })
         })
         .build();
 
-    let mut client = serenity::ClientBuilder::new(api_token, intents)
-        .framework(framework)
-        .await
-        .unwrap();
+    let mut client = ClientBuilder::new(api_token, intents).framework(framework).await.unwrap();
 
     let tracker = TaskTracker::new();
     let token = CancellationToken::new();
@@ -510,25 +468,27 @@ async fn main() {
             match run_notifications(&mut config, &http).await {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error running notifications: {:?}", e);
+                    error!("Error running notifications: {:?}", e);
                 }
             }
         }
     }));
 
     let shard_manager = client.shard_manager.clone();
+    let cloned_token = token.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Could not register ctrl+c handler");
+        select! {
+            _ = cloned_token.cancelled() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
         shard_manager.shutdown_all().await;
     });
 
-    println!("Starting client...");
+    info!("Starting client...");
     if let Err(why) = client.start().await {
-        eprintln!("Client error: {:?}", why);
+        error!("Client error: {:?}", why);
     }
-    println!("Shutting down gracefully...");
+    info!("Shutting down gracefully...");
     token.cancel();
     tracker.close();
     tracker.wait().await;

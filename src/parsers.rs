@@ -26,6 +26,11 @@ static CARD_TODO_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concatcp!(r"Next Card Pull: \*\*", DURATION_PATTERN, r"\*\* \(<t:(\d+)>\)")).unwrap()
 });
 
+static MECHANIC_TODO_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concatcp!(r"Mechanic Finishes: \*\*", DURATION_PATTERN, r"\*\* \(<t:(\d+)>\)"))
+        .unwrap()
+});
+
 static PROFILE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(concatcp!(r"change profiles in ", DURATION_PATTERN)).unwrap());
 
@@ -139,6 +144,32 @@ pub fn extract_card_cooldown(message: &Message) -> Option<Timestamp> {
 
     // Terminal `to-do` command
     if let Some(ts) = CARD_TODO_RE
+        .captures(&message.content)
+        .and_then(|captures| captures[5].parse().ok())
+        .and_then(|secs| Timestamp::from_unix_timestamp(secs).ok())
+    {
+        return Some(ts);
+    }
+
+    None
+}
+
+pub fn extract_mechanic_cooldown(message: &Message) -> Option<Timestamp> {
+    if let Some(embed) = message.embeds.first() {
+        // info command
+        if let Some(description) = &embed.description {
+            if let Some(ts) = MECHANIC_TODO_RE
+                .captures(description)
+                .and_then(|captures| captures[5].parse().ok())
+                .and_then(|secs| Timestamp::from_unix_timestamp(secs).ok())
+            {
+                return Some(ts);
+            }
+        }
+    }
+
+    // Terminal `to-do` command
+    if let Some(ts) = MECHANIC_TODO_RE
         .captures(&message.content)
         .and_then(|captures| captures[5].parse().ok())
         .and_then(|secs| Timestamp::from_unix_timestamp(secs).ok())
@@ -357,6 +388,29 @@ __**Upcoming Events**__
         assert_eq!(
             extract_card_cooldown(&message),
             Some(Timestamp::from_unix_timestamp(1711437242).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_extract_mechanic_cooldown_info() {
+        let mut message = Message::default();
+        message.author.id = ZOO_USER_ID;
+        let mut embed = Embed::default();
+        embed.description = Some(
+            "`$ td`\n\
+            __**Upcoming Events**__\n\
+            > 🎴 Next Card Pull: **2:22:54** (<t:1711560217>)\n\
+            > 🐾 Next Rescue: **4:18:33** (<t:1711567155>)\n\
+            > 🎒 Mechanic Finishes: **8:44:18** (<t:1711583100>)\n\
+            > 💻 Relic Cooldown: **11:58:52** (<t:1711594774>)\n\
+            > 🏕️ Quest Finishes: **4d + 05:51:06** (<t:1711918308>)\n\
+            > 💀 Curse Expires: **13d + 15:10:10** (<t:1712729452>)"
+                .to_string(),
+        );
+        message.embeds.push(embed);
+        assert_eq!(
+            extract_mechanic_cooldown(&message),
+            Some(Timestamp::from_unix_timestamp(1711583100).unwrap())
         );
     }
 }

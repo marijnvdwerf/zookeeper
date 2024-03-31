@@ -16,12 +16,14 @@ poise = "0.6"
 rand = "0.8"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
 serenity = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+uuid = { version = "1.8", features = ["fast-rng", "v4"] }
 
 [dependencies.reqwest]
 version = "*"
@@ -31,3 +33,7 @@ features = ["rustls", "json", "brotli", "gzip", "deflate"]
 [build-dependencies]
 anyhow = "1.0"
 vergen = { version = "8.3", features = ["build", "rustc"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

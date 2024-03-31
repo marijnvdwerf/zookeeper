@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt::Display,
     ops::Sub,
     sync::Arc,
@@ -8,33 +8,36 @@ use std::{
 
 use anyhow::{Context as _, Error, Result};
 use chrono::TimeDelta;
-use poise::{builtins::register_globally, command, CreateReply, Framework, FrameworkOptions};
+use poise::{
+    builtins::register_globally, command, CreateReply, Framework, FrameworkError, FrameworkOptions,
+};
 use serenity::{
-    all::CreateEmbedFooter,
+    all::CreateMessage,
     builder::{
-        CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateInteractionResponse,
-        CreateInteractionResponseMessage,
+        CreateActionRow, CreateAllowedMentions, CreateButton, CreateEmbed, CreateEmbedAuthor,
+        CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage,
     },
     cache::Cache,
     client::{ClientBuilder, Context as SerenityContext, FullEvent},
     gateway::ActivityData,
     http::{CacheHttp, Http},
     model::prelude::*,
-    utils::{FormattedTimestamp, FormattedTimestampStyle},
+    utils::{EmbedMessageBuilding, FormattedTimestamp, FormattedTimestampStyle, MessageBuilder},
     Client,
 };
 use tokio::{select, sync::RwLock, task, time};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 mod parsers;
 mod zoo;
 
 use parsers::{
-    extract_card_cooldown, extract_profile_cooldown, extract_quest_cooldown,
-    extract_rescue_cooldown,
+    extract_card_cooldown, extract_mechanic_cooldown, extract_profile_cooldown,
+    extract_quest_cooldown, extract_rescue_cooldown,
 };
-use zoo::{fetch_zoo_profile, profile_url};
+use zoo::{fetch_zoo_profile, profile_url, ZooProfileAnimal, ZooProfileResponse};
 
 struct Data {
     start_time: Timestamp,
@@ -54,6 +57,7 @@ enum CooldownKind {
     Rescue,
     Quest,
     Card,
+    Mechanic,
     Profile,
 }
 
@@ -63,6 +67,7 @@ impl CooldownKind {
             CooldownKind::Rescue => "🐾",
             CooldownKind::Quest => "🏕️",
             CooldownKind::Card => "🎴",
+            CooldownKind::Mechanic => "🔧",
             CooldownKind::Profile => "👤",
         }
     }
@@ -74,6 +79,7 @@ impl Display for CooldownKind {
             CooldownKind::Rescue => write!(f, "Rescue"),
             CooldownKind::Quest => write!(f, "Quest"),
             CooldownKind::Card => write!(f, "Card"),
+            CooldownKind::Mechanic => write!(f, "Mechanic"),
             CooldownKind::Profile => write!(f, "Profile"),
         }
     }
@@ -98,6 +104,7 @@ struct Config {
     cooldowns: Vec<Cooldown>,
     disabled_users: BTreeSet<UserId>,
     manual_users: BTreeSet<UserId>,
+    channel_users: BTreeMap<ChannelId, BTreeSet<UserId>>,
 }
 
 async fn load_config() -> Result<Config> {
@@ -241,6 +248,9 @@ async fn extract_message_cooldowns(
     if let Some(timestamp) = extract_quest_cooldown(message) {
         cooldown_kinds.push((CooldownKind::Quest, timestamp));
     }
+    if let Some(timestamp) = extract_mechanic_cooldown(message) {
+        cooldown_kinds.push((CooldownKind::Mechanic, timestamp));
+    }
     if let Some(timestamp) = extract_profile_cooldown(message) {
         cooldown_kinds.push((CooldownKind::Profile, timestamp));
     }
@@ -276,7 +286,12 @@ async fn check_cooldown_message<'a>(
         return Ok(());
     };
     let user_id = interaction.user.id;
-    let config = data.config.read().await;
+    let mut config = data.config.write().await;
+    // Add user to channel users if not already present
+    if config.channel_users.entry(message.channel_id).or_insert_with(BTreeSet::new).insert(user_id)
+    {
+        save_config(&config).await?;
+    }
     if config.disabled_users.contains(&user_id) {
         return Ok(());
     }
@@ -374,8 +389,10 @@ async fn handle_interaction<'a>(
                     component.channel_id,
                 );
                 drop(config);
-                let message =
-                    CreateInteractionResponseMessage::new().components(components).content(message);
+                let message = CreateInteractionResponseMessage::new()
+                    .components(components)
+                    .content(message)
+                    .allowed_mentions(CreateAllowedMentions::new());
                 component
                     .create_response(ctx, CreateInteractionResponse::UpdateMessage(message))
                     .await?;
@@ -435,27 +452,26 @@ async fn botstatus(ctx: Context<'_>) -> Result<(), Error> {
     if let Some(avatar_url) = data.current_user.avatar_url() {
         author = author.icon_url(avatar_url);
     }
-    let mut description = String::new();
+    let mut description = MessageBuilder::new();
     for owner in &config.owners {
         if let Ok(user) = owner.to_user(ctx).await {
-            description.push_str(&format!("**Created by:** {}\n", user.name));
+            description.push_bold("Created by: ").push_line_safe(user.name);
         }
     }
-    description.push_str(&format!("**Version:** v{}\n", env!("CARGO_PKG_VERSION")));
-    description.push_str(&format!(
-        "**Shard:** {}\n",
-        data.shard.map_or("unknown".to_string(), |s| format!("{}/{}", s.id.0 + 1, s.total))
-    ));
-    description.push_str(&format!(
-        "**Uptime:** {}\n",
+    description.push_bold("Version: ").push_line(env!("CARGO_PKG_VERSION"));
+    description.push_bold("Shard: ").push_line(
+        data.shard.map_or("unknown".to_string(), |s| format!("{}/{}", s.id.0 + 1, s.total)),
+    );
+    description.push_bold("Uptime: ").push_line(
         FormattedTimestamp::new(data.start_time, Some(FormattedTimestampStyle::RelativeTime))
-    ));
-    description.push_str(&format!("**Rust version:** v{}\n", env!("VERGEN_RUSTC_SEMVER")));
-    description.push_str(&format!("**Memory usage:** {}\n", memory));
-    description.push_str(&format!("**Tracked cooldowns:** {}\n", config.cooldowns.len()));
+            .to_string(),
+    );
+    description.push_bold("Rust version: ").push(env!("VERGEN_RUSTC_SEMVER")).push_line(" 🦀");
+    description.push_bold("Memory usage: ").push_line(memory);
+    description.push_bold("Tracked cooldowns: ").push_line(config.cooldowns.len().to_string());
     let embed = CreateEmbed::default()
         .author(author)
-        .description(description)
+        .description(description.build())
         .footer(CreateEmbedFooter::new(format!("Ping: {}ms", ping.as_millis())));
     drop(config);
     ctx.send(CreateReply::default().embed(embed)).await?;
@@ -472,7 +488,11 @@ async fn cooldowns(
     let (message, components) =
         create_cooldowns_message(&config, user, false, ctx.author().id, ctx.channel_id());
     drop(config);
-    ctx.send(CreateReply::default().content(message).components(components)).await?;
+    let reply = CreateReply::default()
+        .content(message)
+        .components(components)
+        .allowed_mentions(CreateAllowedMentions::new());
+    ctx.send(reply).await?;
     Ok(())
 }
 
@@ -496,62 +516,65 @@ fn create_cooldowns_message(
         })
         .collect::<Vec<_>>();
     cooldowns.sort_by_key(|cooldown| cooldown.timestamp);
-    let mut message = if cooldowns.is_empty() {
-        if let Some(user) = &user {
-            format!("No cooldowns tracked for {}.", user.mention())
-        } else if show_all {
-            format!("No cooldowns tracked in {}.", current_channel.mention())
+
+    let mut message = MessageBuilder::new();
+    message.push("Tracking & notifications: ");
+    if let Some(user) = &user {
+        if config.disabled_users.contains(&user.id) {
+            message.push_bold("disabled").push_line(" ❌");
         } else {
-            "No cooldowns tracked. Use Zoo `/rescue` to start.".to_string()
+            message.push_bold("enabled").push_line(" ✅");
+        }
+    } else if config.disabled_users.contains(&current_user) {
+        message.push_bold("disabled").push_line(" ❌");
+    } else {
+        message.push_bold("enabled").push_line(" ✅");
+    }
+
+    message.push("Auto mode: ");
+    if let Some(user) = &user {
+        if config.manual_users.contains(&user.id) {
+            message.push_bold("disabled").push_line(" ❌");
+        } else {
+            message.push_bold("enabled").push_line(" ✅");
+        }
+    } else if config.manual_users.contains(&current_user) {
+        message.push_bold("disabled").push_line(" ❌");
+    } else {
+        message.push_bold("enabled").push_line(" ✅");
+    }
+
+    if cooldowns.is_empty() {
+        if let Some(user) = &user {
+            message.push("No cooldowns tracked for ").user(user).push_line(".");
+        } else if show_all {
+            message.push("No cooldowns tracked in ").channel(current_channel).push_line(".");
+        } else {
+            message.push_line("No cooldowns tracked. Use Zoo `/rescue` to start.");
         }
     } else {
-        let mut output = if let Some(user) = &user {
-            format!("Cooldowns tracked for {}:\n", user.mention())
+        if let Some(user) = &user {
+            message.push("Cooldowns tracked for ").user(user).push_line(":");
         } else if show_all {
-            format!("Cooldowns tracked in {}:\n", current_channel.mention())
+            message.push("Cooldowns tracked in ").channel(current_channel).push_line(":");
         } else {
-            "Your tracked cooldowns:\n".to_string()
+            message.push_line("Your tracked cooldowns:");
         };
         for cooldown in cooldowns.iter().take(15) {
             if show_all {
-                output.push_str(&format!(
-                    "- {}: {}\n",
-                    cooldown.user_id.mention(),
-                    format_cooldown(cooldown)
-                ));
+                message
+                    .push("- ")
+                    .user(cooldown.user_id)
+                    .push(": ")
+                    .push_line(format_cooldown(cooldown));
             } else {
-                output.push_str(&format!("- {}\n", format_cooldown(cooldown)));
+                message.push("- ").push_line(format_cooldown(cooldown));
             }
         }
         if cooldowns.len() > 15 {
-            output.push_str(&format!("... and {} more", cooldowns.len() - 15));
+            message.push_line(format!("... and {} more", cooldowns.len() - 15));
         }
-        output
     };
-
-    if let Some(user) = &user {
-        if config.manual_users.contains(&user.id) {
-            message = format!("Auto mode: **disabled** ❌\n{}", message);
-        } else {
-            message = format!("Auto mode: **enabled** ✅\n{}", message);
-        }
-    } else if config.manual_users.contains(&current_user) {
-        message = format!("Auto mode: **disabled** ❌\n{}", message);
-    } else {
-        message = format!("Auto mode: **enabled** ✅\n{}", message);
-    }
-
-    if let Some(user) = &user {
-        if config.disabled_users.contains(&user.id) {
-            message = format!("Tracking & notifications: **disabled** ❌\n{}", message);
-        } else {
-            message = format!("Tracking & notifications: **enabled** ✅\n{}", message);
-        }
-    } else if config.disabled_users.contains(&current_user) {
-        message = format!("Tracking & notifications: **disabled** ❌\n{}", message);
-    } else {
-        message = format!("Tracking & notifications: **enabled** ✅\n{}", message);
-    }
 
     let mut components = vec![];
     if user.is_none() {
@@ -573,7 +596,7 @@ fn create_cooldowns_message(
         }
         components.push(CreateActionRow::Buttons(buttons));
     }
-    (message, components)
+    (message.build(), components)
 }
 
 /// Disable bot tracking and notifications
@@ -599,29 +622,124 @@ async fn enable(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn format_cooldown(cooldown: &Cooldown) -> String {
-    if cooldown.kind == CooldownKind::Profile {
-        format!(
-            "{} {} {}",
-            cooldown.kind.emoji(),
-            cooldown.kind,
-            FormattedTimestamp::new(
-                cooldown.timestamp,
-                Some(FormattedTimestampStyle::RelativeTime)
-            ),
-        )
+/// Find an animal in any channel user's profile
+#[command(slash_command)]
+async fn find(ctx: Context<'_>, #[description = "Animal name"] name: String) -> Result<(), Error> {
+    // Start typing to show that the bot is searching
+    ctx.defer().await?;
+
+    let config = ctx.data().config.read().await;
+    let user_ids = config
+        .channel_users
+        .get(&ctx.channel_id())
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut profiles = vec![];
+    for user_id in user_ids {
+        let profile = fetch_zoo_profile(&ctx.data().client, user_id.get(), None)
+            .await
+            .with_context(|| format!("Failed to fetch profile for user ID {}", user_id))?;
+        // Also fetch other profiles from the same user
+        for profile_name in &profile.profiles {
+            if profile_name == &profile.profile_id {
+                continue;
+            }
+            let profile =
+                fetch_zoo_profile(&ctx.data().client, user_id.get(), Some(profile_name.as_str()))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to fetch profile for user ID {} (profile {})",
+                            user_id, profile_name
+                        )
+                    })?;
+            profiles.push(profile);
+        }
+        profiles.push(profile);
+    }
+    drop(config);
+    struct FoundAnimal<'a> {
+        profile: &'a ZooProfileResponse,
+        animal: &'a ZooProfileAnimal,
+        // Profile also has the rare version of the animal
+        has_rare: bool,
+    }
+    let mut found = vec![];
+    for profile in &profiles {
+        if let Some(animal) = profile
+            .animals
+            .iter()
+            .find(|animal| animal.amount > 0 && animal.name.eq_ignore_ascii_case(&name))
+        {
+            let has_rare = !animal.rare
+                && profile
+                    .animals
+                    .iter()
+                    .any(|v| v.rare && v.amount > 0 && v.family == animal.family);
+            found.push(FoundAnimal { profile, animal, has_rare });
+        }
+    }
+    found.sort_by(|a, b| {
+        // Pinned animals last, then profiles with rare first, then by amount
+        a.animal.pinned.cmp(&b.animal.pinned).then_with(|| {
+            b.has_rare.cmp(&a.has_rare).then_with(|| b.animal.amount.cmp(&a.animal.amount))
+        })
+    });
+    let mut message = MessageBuilder::new();
+    if found.is_empty() {
+        message
+            .push("Couldn't find ")
+            .push_bold_safe(&name)
+            .push(format!(" in {} profiles.", profiles.len()));
     } else {
-        format!(
-            "[**{}**](<{}>) {} {} {}",
-            cooldown.profile_name,
-            profile_url(cooldown.user_id.get(), Some(&cooldown.profile)),
-            cooldown.kind.emoji(),
-            cooldown.kind,
-            FormattedTimestamp::new(
-                cooldown.timestamp,
-                Some(FormattedTimestampStyle::RelativeTime)
-            ),
-        )
+        // let mut message = format!("Found **{}** in {} profiles:\n", name, found.len());
+        message
+            .push("Found ")
+            .push_bold_safe(&name)
+            .push_line(format!(" in {} profiles:", found.len()));
+        for found in found.iter().take(10) {
+            let user_id: UserId = found.profile.user_id.parse()?;
+            message
+                .push("- ")
+                .push_bold(format!("{}x", found.animal.amount))
+                .push(" in ")
+                .push(profile_link(&found.profile.name, user_id, Some(&found.profile.profile_id)));
+            if found.has_rare {
+                message.push(" 🌟");
+            }
+            if found.animal.pinned {
+                message.push(" 📌");
+            }
+            message.push_line("");
+        }
+        if found.len() > 10 {
+            message.push_line(format!("... and {} more", found.len() - 10));
+        }
+    }
+    let reply = CreateReply::default()
+        .content(message.build())
+        .allowed_mentions(CreateAllowedMentions::new());
+    ctx.send(reply).await?;
+    Ok(())
+}
+
+fn format_cooldown(cooldown: &Cooldown) -> String {
+    let cooldown_msg = format!(
+        "{} {} {}",
+        cooldown.kind.emoji(),
+        cooldown.kind,
+        FormattedTimestamp::new(cooldown.timestamp, Some(FormattedTimestampStyle::RelativeTime)),
+    );
+    if cooldown.kind == CooldownKind::Profile {
+        cooldown_msg
+    } else {
+        MessageBuilder::new()
+            .push(profile_link(&cooldown.profile_name, cooldown.user_id, Some(&cooldown.profile)))
+            .push(" ")
+            .push(cooldown_msg)
+            .build()
     }
 }
 
@@ -642,7 +760,11 @@ impl CacheHttp for MyCacheHttp {
     fn cache(&self) -> Option<&Arc<Cache>> { Some(&self.cache) }
 }
 
-async fn run_notifications(config: &RwLock<Config>, http: &MyCacheHttp) -> Result<(), Error> {
+async fn run_notifications(
+    config: &RwLock<Config>,
+    http: &MyCacheHttp,
+    client: &reqwest::Client,
+) -> Result<(), Error> {
     let mut config = config.write().await;
     let now = Timestamp::now();
     let mut any_expired = false;
@@ -661,25 +783,43 @@ async fn run_notifications(config: &RwLock<Config>, http: &MyCacheHttp) -> Resul
                 // Remove but don't notify
                 continue;
             }
-            let message = if cooldown.kind == CooldownKind::Profile {
-                format!(
-                    "{} {} {} cooldown finished",
-                    cooldown.user_id.mention(),
-                    cooldown.kind.emoji(),
-                    cooldown.kind
-                )
-            } else {
-                format!(
-                    "{} {} {} cooldown finished for [**{}**](<{}>)\n```/profiles profile:{}```",
-                    cooldown.user_id.mention(),
-                    cooldown.kind.emoji(),
-                    cooldown.kind,
-                    cooldown.profile_name,
-                    profile_url(cooldown.user_id.get(), Some(&cooldown.profile)),
-                    cooldown.profile
-                )
-            };
-            messages.push((cooldown.channel_id, message));
+            let mut message = MessageBuilder::new();
+            message
+                .user(cooldown.user_id)
+                .push(format!(" {} {}", cooldown.kind.emoji(), cooldown.kind))
+                .push(" cooldown finished");
+            if cooldown.kind != CooldownKind::Profile {
+                message.push(" for ").push(profile_link(
+                    &cooldown.profile_name,
+                    cooldown.user_id,
+                    Some(&cooldown.profile),
+                ));
+                let current_profile = fetch_zoo_profile(client, cooldown.user_id.get(), None)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to fetch profile for user ID {}", cooldown.user_id.get())
+                    })?;
+                if current_profile.profile_id == cooldown.profile {
+                    message.push(" (current profile)");
+                } else {
+                    message
+                        .push("\n\nCurrent profile: ")
+                        .push(profile_link(
+                            &current_profile.name,
+                            cooldown.user_id,
+                            Some(&current_profile.profile_id),
+                        ))
+                        .push(". Switch profiles with: ")
+                        .push_codeblock_safe(
+                            format!("/profiles profile:{}", cooldown.profile),
+                            None,
+                        );
+                }
+            }
+            let reply = CreateMessage::default()
+                .content(message.build())
+                .allowed_mentions(CreateAllowedMentions::new().users([cooldown.user_id]));
+            messages.push((cooldown.channel_id, reply));
         }
     }
     if any_expired {
@@ -688,7 +828,7 @@ async fn run_notifications(config: &RwLock<Config>, http: &MyCacheHttp) -> Resul
     }
     drop(config);
     for (channel_id, message) in messages {
-        if let Err(e) = channel_id.say(http, &message).await {
+        if let Err(e) = channel_id.send_message(http, message).await {
             error!("Failed to send message: {:?}", e);
         }
     }
@@ -709,11 +849,20 @@ async fn main() {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::GUILD_MESSAGE_REACTIONS
         | GatewayIntents::MESSAGE_CONTENT;
+    let reqwest_client = reqwest::Client::new();
 
     let cloned_config = config.clone();
+    let cloned_reqwest_client = reqwest_client.clone();
     let framework = Framework::builder()
         .options(FrameworkOptions {
-            commands: vec![botstatus(), cooldowns(), disable(), enable()],
+            commands: vec![botstatus(), cooldowns(), disable(), enable(), find()],
+            on_error: |error| {
+                Box::pin(async move {
+                    if let Err(e) = on_error(error).await {
+                        error!("Error while handling error: {:?}", e);
+                    }
+                })
+            },
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
@@ -739,7 +888,7 @@ async fn main() {
                 Ok(Data {
                     start_time: Timestamp::now(),
                     config: cloned_config,
-                    client: reqwest::Client::new(),
+                    client: cloned_reqwest_client,
                     current_user: ready.user.clone(),
                     shard: ready.shard,
                 })
@@ -754,6 +903,7 @@ async fn main() {
     let cloned_token = token.clone();
     let cloned_config = config.clone();
     let cache_http = MyCacheHttp::new(&client);
+    let cloned_reqwest_client = reqwest_client.clone();
     tracker.spawn(task::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(1000));
         loop {
@@ -761,7 +911,7 @@ async fn main() {
                 _ = cloned_token.cancelled() => break,
                 _ = interval.tick() => {},
             }
-            match run_notifications(&cloned_config, &cache_http).await {
+            match run_notifications(&cloned_config, &cache_http, &cloned_reqwest_client).await {
                 Ok(()) => {}
                 Err(e) => {
                     error!("Error running notifications: {:?}", e);
@@ -790,4 +940,39 @@ async fn main() {
     tracker.wait().await;
     let guard = config.read().await;
     save_config(&guard).await.unwrap();
+}
+
+async fn on_error(error: FrameworkError<'_, Data, Error>) -> Result<()> {
+    match error {
+        FrameworkError::Setup { error, .. } => {
+            error!("User data setup error: {:?}", error);
+        }
+        FrameworkError::EventHandler { error, event, .. } => {
+            error!("Event {} handler error: {:?}", event.snake_case_name(), error)
+        }
+        FrameworkError::Command { ctx, error, .. } => {
+            let error_id = Uuid::new_v4();
+            error!("Command error {}: {:?}", error_id, error);
+            let embed = CreateEmbed::new()
+                .title("⚠️ Error")
+                .description("Command failed.")
+                .field("Message", error.to_string(), false)
+                .field("Error ID", error_id.to_string(), false)
+                .color(Colour::RED);
+            let reply = CreateReply::default()
+                .embed(embed)
+                .ephemeral(true)
+                .allowed_mentions(CreateAllowedMentions::new());
+            ctx.send(reply).await?;
+        }
+        _ => poise::builtins::on_error(error).await?,
+    }
+    Ok(())
+}
+
+fn profile_link(name: &str, user_id: UserId, profile: Option<&str>) -> String {
+    let mut message = MessageBuilder::new();
+    let name = MessageBuilder::new().push_bold_safe(name).build();
+    message.push_named_link_safe(name, format!("<{}>", profile_url(user_id.get(), profile)));
+    message.build()
 }

@@ -1,3 +1,5 @@
+use anyhow::{Error, Result};
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ZooProfileUser {
     pub avatar: Option<String>,
@@ -288,7 +290,12 @@ pub async fn fetch_zoo_profile(
     client: &reqwest::Client,
     user_id: u64,
     profile: Option<&str>,
-) -> Result<ZooProfileResponse, reqwest::Error> {
+) -> Result<ZooProfileResponse> {
     let api_url = profile_api_url(user_id, profile);
-    client.get(&api_url).send().await?.json().await
+    let response = client.get(&api_url).send().await?;
+    let text = response.text().await?;
+    match serde_json::from_str(&text) {
+        Ok(profile) => Ok(profile),
+        Err(e) => Err(Error::new(e).context(format!("Response body: {}", text))),
+    }
 }

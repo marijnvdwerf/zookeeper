@@ -51,6 +51,110 @@ type FrameworkContext<'a> = poise::FrameworkContext<'a, Data, Error>;
 
 const ZOO_USER_ID: UserId = UserId::new(1008563327380766812);
 
+const ANIMAL_NAMES: [&str; 100] = [
+    "bat",
+    "bear",
+    "beaver",
+    "beetle",
+    "camel",
+    "cat",
+    "caterpillar",
+    "chick",
+    "chicken",
+    "cow",
+    "crab",
+    "cricket",
+    "crocodile",
+    "dinosaur",
+    "dog",
+    "dove",
+    "duck",
+    "elephant",
+    "fish",
+    "fly",
+    "fox",
+    "frog",
+    "giraffe",
+    "gorilla",
+    "hamster",
+    "hedgehog",
+    "hippo",
+    "horse",
+    "koala",
+    "leopard",
+    "lizard",
+    "mouse",
+    "ox",
+    "parrot",
+    "penguin",
+    "pig",
+    "rabbit",
+    "seal",
+    "sheep",
+    "shrimp",
+    "skunk",
+    "sloth",
+    "snail",
+    "snowman",
+    "spider",
+    "squid",
+    "turkey",
+    "whale",
+    "worm",
+    "zebra",
+    // rare animals
+    "bactrian camel",
+    "badger",
+    "bee",
+    "bird",
+    "bison",
+    "boar",
+    "bunny",
+    "butterfly",
+    "chipmunk",
+    "cockroach",
+    "deer",
+    "dodo",
+    "dolphin",
+    "dragon",
+    "eagle",
+    "flamingo",
+    "goat",
+    "kangaroo",
+    "ladybug",
+    "lion",
+    "llama",
+    "lobster",
+    "mammoth",
+    "monkey",
+    "mosquito",
+    "octopus",
+    "orangutan",
+    "otter",
+    "owl",
+    "panda",
+    "peacock",
+    "polar bear",
+    "poodle",
+    "pufferfish",
+    "raccoon",
+    "ram",
+    "rat",
+    "rhino",
+    "rooster",
+    "scorpion",
+    "shark",
+    "snake",
+    "snowier man",
+    "swan",
+    "t-rex",
+    "tiger",
+    "tropical fish",
+    "turtle",
+    "unicorn",
+    "wolf",
+];
+
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum CooldownKind {
     #[default]
@@ -627,6 +731,17 @@ async fn enable(ctx: Context<'_>) -> Result<(), Error> {
 async fn find(ctx: Context<'_>, #[description = "Animal name"] name: String) -> Result<(), Error> {
     // Start typing to show that the bot is searching
     ctx.defer().await?;
+
+    if !ANIMAL_NAMES.iter().any(|animal| animal.eq_ignore_ascii_case(&name)) {
+        let mut message = MessageBuilder::new();
+        message.push_bold_safe(&name).push(" is not a valid animal.");
+
+        let reply = CreateReply::default()
+            .content(message.build())
+            .allowed_mentions(CreateAllowedMentions::new());
+        ctx.send(reply).await?;
+        return Ok(());
+    }
 
     let config = ctx.data().config.read().await;
     let user_ids = config

@@ -37,7 +37,7 @@ use parsers::{
     extract_card_cooldown, extract_mechanic_cooldown, extract_profile_cooldown,
     extract_quest_cooldown, extract_rescue_cooldown,
 };
-use zoo::{fetch_zoo_profile, profile_url, ZooProfileAnimal, ZooProfileResponse};
+use zoo::{fetch_zoo_profile, profile_url, ZooProfileAnimal, ZooProfileResponse, ZooProfileResult};
 
 struct Data {
     start_time: Timestamp,
@@ -338,6 +338,7 @@ async fn remove_cooldowns(
 }
 
 async fn extract_message_cooldowns(
+    http: impl CacheHttp,
     message: &Message,
     user_id: UserId,
     data: &Data,
@@ -361,9 +362,10 @@ async fn extract_message_cooldowns(
     if cooldown_kinds.is_empty() {
         return Ok(vec![]);
     }
-    let profile = fetch_zoo_profile(&data.client, user_id.get(), None)
-        .await
-        .with_context(|| format!("Failed to fetch profile for user ID {}", user_id.get()))?;
+    let Some(profile) = try_fetch_profile(&data.client, user_id, None).await else {
+        message.react(http, ReactionType::Unicode("⚠️".to_string())).await?;
+        return Ok(vec![]);
+    };
     let cooldowns = cooldown_kinds
         .into_iter()
         .map(|(kind, timestamp)| Cooldown {
@@ -401,7 +403,7 @@ async fn check_cooldown_message<'a>(
     }
     let manual = config.manual_users.contains(&user_id);
     drop(config);
-    let cooldowns = extract_message_cooldowns(message, user_id, data).await?;
+    let cooldowns = extract_message_cooldowns(ctx, message, user_id, data).await?;
     if cooldowns.is_empty() {
         return Ok(());
     }
@@ -437,7 +439,7 @@ async fn handle_reaction<'a>(
     if user_id != interaction.user.id {
         return Ok(());
     }
-    for cooldown in extract_message_cooldowns(&message, user_id, data).await? {
+    for cooldown in extract_message_cooldowns(ctx, &message, user_id, data).await? {
         if cooldown.kind.emoji() == emoji {
             if add {
                 add_cooldowns(ctx, &message, &[cooldown], data).await?;
@@ -726,6 +728,28 @@ async fn enable(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn try_fetch_profile(
+    client: &reqwest::Client,
+    user_id: UserId,
+    profile: Option<&str>,
+) -> Option<Box<ZooProfileResponse>> {
+    match fetch_zoo_profile(client, user_id.get(), profile).await {
+        Ok(ZooProfileResult::Profile(profile)) => Some(profile),
+        Ok(ZooProfileResult::Invalid(error)) => {
+            warn!("Failed to fetch profile for {}: {:?}", user_id, error);
+            None
+        }
+        Ok(ZooProfileResult::ApiError(error)) => {
+            warn!("Failed to fetch profile for {}: {:?}", user_id, error);
+            None
+        }
+        Err(e) => {
+            warn!("Failed to fetch profile {}: {:?}", user_id, e);
+            None
+        }
+    }
+}
+
 /// Find an animal in any channel user's profile
 #[command(slash_command)]
 async fn find(ctx: Context<'_>, #[description = "Animal name"] name: String) -> Result<(), Error> {
@@ -752,24 +776,23 @@ async fn find(ctx: Context<'_>, #[description = "Animal name"] name: String) -> 
         .cloned()
         .collect::<Vec<_>>();
     let mut profiles = vec![];
+    let mut failed_profiles = false;
     for user_id in user_ids {
-        let profile = fetch_zoo_profile(&ctx.data().client, user_id.get(), None)
-            .await
-            .with_context(|| format!("Failed to fetch profile for user ID {}", user_id))?;
+        let Some(profile) = try_fetch_profile(&ctx.data().client, user_id, None).await else {
+            failed_profiles = true;
+            continue;
+        };
         // Also fetch other profiles from the same user
         for profile_name in &profile.profiles {
             if profile_name == &profile.profile_id {
                 continue;
             }
-            let profile =
-                fetch_zoo_profile(&ctx.data().client, user_id.get(), Some(profile_name.as_str()))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to fetch profile for user ID {} (profile {})",
-                            user_id, profile_name
-                        )
-                    })?;
+            let Some(profile) =
+                try_fetch_profile(&ctx.data().client, user_id, Some(profile_name.as_str())).await
+            else {
+                failed_profiles = true;
+                continue;
+            };
             profiles.push(profile);
         }
         profiles.push(profile);
@@ -803,6 +826,9 @@ async fn find(ctx: Context<'_>, #[description = "Animal name"] name: String) -> 
         })
     });
     let mut message = MessageBuilder::new();
+    if failed_profiles {
+        message.push_line("⚠️ Some profiles couldn't be fetched, results may be incomplete.");
+    }
     if found.is_empty() {
         message
             .push("Couldn't find ")
@@ -909,26 +935,26 @@ async fn run_notifications(
                     cooldown.user_id,
                     Some(&cooldown.profile),
                 ));
-                let current_profile = fetch_zoo_profile(client, cooldown.user_id.get(), None)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to fetch profile for user ID {}", cooldown.user_id.get())
-                    })?;
-                if current_profile.profile_id == cooldown.profile {
-                    message.push(" (current profile)");
+                let result = fetch_zoo_profile(client, cooldown.user_id.get(), None).await;
+                if let Ok(ZooProfileResult::Profile(current_profile)) = result {
+                    if current_profile.profile_id == cooldown.profile {
+                        message.push(" (current profile)");
+                    } else {
+                        message
+                            .push("\n\nCurrent profile: ")
+                            .push(profile_link(
+                                &current_profile.name,
+                                cooldown.user_id,
+                                Some(&current_profile.profile_id),
+                            ))
+                            .push(". Switch profiles with: ")
+                            .push_codeblock_safe(
+                                format!("/profiles profile:{}", cooldown.profile),
+                                None,
+                            );
+                    }
                 } else {
-                    message
-                        .push("\n\nCurrent profile: ")
-                        .push(profile_link(
-                            &current_profile.name,
-                            cooldown.user_id,
-                            Some(&current_profile.profile_id),
-                        ))
-                        .push(". Switch profiles with: ")
-                        .push_codeblock_safe(
-                            format!("/profiles profile:{}", cooldown.profile),
-                            None,
-                        );
+                    message.push(" (⚠️ failed to fetch current profile)");
                 }
             }
             let reply = CreateMessage::default()

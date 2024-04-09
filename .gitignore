@@ -1,4 +1,4 @@
 /target
 .idea/
-config.toml
+config*.toml
 !.cargo/config.toml

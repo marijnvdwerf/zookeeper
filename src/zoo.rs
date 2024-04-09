@@ -34,7 +34,7 @@ pub struct ZooProfileAnimal {
 pub struct ZooProfileRelic {
     pub name: String,
     pub emoji: String,
-    pub description: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -58,7 +58,9 @@ pub struct ZooProfileQuest {
     #[serde(rename = "type")]
     pub kind: String,
     pub emoji: String,
-    pub days: u32,
+    pub days: f32,
+    #[serde(default)]
+    pub mins: u32,
     pub completed: u32,
 }
 
@@ -270,6 +272,24 @@ pub struct ZooProfileResponse {
     pub settings: ZooProfileSettings,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooApiErrorResponse {
+    #[serde(rename = "apiError")]
+    pub api_error: bool,
+    #[serde(rename = "internalError")]
+    pub internal_error: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooErrorResponse {
+    pub name: String,
+    pub msg: String,
+    pub login: bool,
+    pub invalid: bool,
+    pub error: String,
+}
+
 pub fn profile_url(user_id: u64, profile: Option<&str>) -> String {
     if let Some(profile) = profile {
         format!("https://gdcolon.com/zoo/{}_{}", user_id, profile)
@@ -286,16 +306,31 @@ pub fn profile_api_url(user_id: u64, profile: Option<&str>) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ZooProfileResult {
+    Profile(Box<ZooProfileResponse>),
+    Invalid(Box<ZooErrorResponse>),
+    ApiError(Box<ZooApiErrorResponse>),
+}
+
 pub async fn fetch_zoo_profile(
     client: &reqwest::Client,
     user_id: u64,
     profile: Option<&str>,
-) -> Result<ZooProfileResponse> {
+) -> Result<ZooProfileResult> {
     let api_url = profile_api_url(user_id, profile);
     let response = client.get(&api_url).send().await?;
     let text = response.text().await?;
     match serde_json::from_str(&text) {
-        Ok(profile) => Ok(profile),
-        Err(e) => Err(Error::new(e).context(format!("Response body: {}", text))),
+        Ok(profile) => Ok(ZooProfileResult::Profile(profile)),
+        Err(e) => {
+            if let Ok(error) = serde_json::from_str(&text) {
+                return Ok(ZooProfileResult::Invalid(error));
+            }
+            if let Ok(error) = serde_json::from_str(&text) {
+                return Ok(ZooProfileResult::ApiError(error));
+            }
+            Err(Error::new(e).context(format!("Response body: {}", text)))
+        }
     }
 }

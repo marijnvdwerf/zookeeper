@@ -27,7 +27,7 @@ pub struct ZooProfileAnimal {
     pub emoji_name: String,
     pub family: String,
     pub rare: bool,
-    pub pinned: bool,
+    pub pinned: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -122,10 +122,15 @@ pub struct ZooProfileTerminalGarden {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ZooProfileTerminalCards {
     pub total: u32,
-    pub common: u32,
-    pub rare: u32,
-    #[serde(rename = "ultraRare")]
-    pub ultra_rare: u32,
+    pub rarities: ZooProfileTerminalCardsRarities,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileTerminalCardsRarities {
+    pub c: u32,
+    pub r: u32,
+    pub d: u32,
+    pub l: u32,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -169,13 +174,10 @@ pub struct ZooProfileTerminal {
     pub commands_found: u32,
     #[serde(default, rename = "mechanicPoints")]
     pub mechanic_points: u32,
+    pub garden: Option<ZooProfileTerminalGarden>,
+    pub cards: ZooProfileTerminalCards,
+    pub fusion: ZooProfileTerminalFusion,
 }
-
-// #[derive(Debug, Clone, serde::Deserialize)]
-// struct ZooProfileStat {
-//     name: String,
-//     value: u32,
-// }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ZooProfileGoal {
@@ -198,6 +200,8 @@ pub struct ZooProfileSettings {
     pub fast_confirmations: bool,
     #[serde(rename = "showAnimalTotals")]
     pub show_animal_totals: bool,
+    #[serde(rename = "disableRescueQuotes")]
+    pub disable_rescue_quotes: bool,
     #[serde(rename = "disableNotifications")]
     pub disable_notifications: bool,
     #[serde(rename = "disableAutoRescues")]
@@ -206,6 +210,8 @@ pub struct ZooProfileSettings {
     pub disable_quest_notifications: bool,
     #[serde(rename = "disableCustomColor")]
     pub disable_custom_color: bool,
+    #[serde(rename = "hideCosmetics")]
+    pub hide_cosmetics: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -232,6 +238,8 @@ pub struct ZooProfileResponse {
     pub unique_animals: ZooProfileUniqueAnimals,
     #[serde(rename = "totalAnimals")]
     pub total_animals: ZooProfileTotalAnimals,
+    #[serde(rename = "pinnedAnimalScore")]
+    pub pinned_animal_score: Option<ZooProfilePinnedAnimalScore>,
     #[serde(rename = "totalItems")]
     pub total_items: u32,
     #[serde(rename = "totalCosmetics")]
@@ -244,6 +252,8 @@ pub struct ZooProfileResponse {
     pub unspent_leader_xp: u32,
     #[serde(rename = "equippedRelics")]
     pub equipped_relics: Vec<String>,
+    #[serde(rename = "equippedCosmetics")]
+    pub equipped_cosmetics: Vec<String>,
     #[serde(rename = "equippedCosmetic")]
     pub equipped_cosmetic: Option<String>,
     #[serde(rename = "equippedLeader")]
@@ -254,6 +264,7 @@ pub struct ZooProfileResponse {
     #[serde(rename = "autoRescues")]
     pub auto_rescues: u32,
     pub animals: Vec<ZooProfileAnimal>,
+    pub items: Vec<ZooProfileItem>,
     pub relics: Vec<ZooProfileRelic>,
     pub cosmetics: Vec<ZooProfileCosmetic>,
     pub leaders: Vec<ZooProfileLeader>,
@@ -261,15 +272,37 @@ pub struct ZooProfileResponse {
     pub quest: Option<ZooProfileActiveQuest>,
     pub curse: Option<ZooProfileCurse>,
     pub terminal: ZooProfileTerminal,
-    // pub stats: Vec<ZooProfileStat>,
+    pub stats: Vec<ZooProfileStat>,
     pub goals: Vec<ZooProfileGoal>,
     #[serde(rename = "goalTiers")]
     pub goal_tiers: u32,
     #[serde(rename = "goalsComplete")]
     pub goals_complete: u32,
-    // #[serde(rename = "extraData")]
-    // pub extra_data: Vec<Vec<String>>,
+    #[serde(rename = "extraData")]
+    pub extra_data: Vec<Vec<serde_json::Value>>,
     pub settings: ZooProfileSettings,
+    pub extra: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfilePinnedAnimalScore {
+    pub red: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileItem {
+    pub name: String,
+    pub amount: u32,
+    pub emoji: String,
+    pub highlight: bool,
+    pub description: Option<String>,
+    pub times_used: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZooProfileStat {
+    pub name: String,
+    pub value: u32,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
